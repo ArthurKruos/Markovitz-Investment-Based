@@ -4,144 +4,192 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import os
-import time
-from datetime import timedelta
 from scipy.optimize import minimize
 
-# ---------- Returns and alignment ----------
-def prices_to_simple_returns(price_series):
-    return price_series.pct_change().dropna()
-
-def align_and_merge_returns(stock_returns_df, crypto_returns_dict):
-    df = stock_returns_df.copy()
-    for sym, series in crypto_returns_dict.items():
-        df[sym] = series
-    df = df.dropna(how='any')  # manter apenas datas em comum
-    return df
-
-# ---------- Markowitz optimization ----------
+# ---------- Funções de Cálculo ----------
 def annualize_returns(mean_daily_returns, periods_per_year=252):
     return mean_daily_returns * periods_per_year
 
 def annualize_cov(cov_daily, periods_per_year=252):
     return cov_daily * periods_per_year
 
-def min_variance_weights(target_return, mu, cov, allow_short=False, max_weight=1.0):
+## MODIFICADO: A função agora aceita mais parâmetros para as novas restrições
+def min_variance_weights(target_return, mu, cov, all_tickers, stock_syms, crypto_syms,
+                         allow_short=False, max_weight=1.0, min_asset_weight=0.0,
+                         min_stock_pct=0.0, min_crypto_pct=0.0):
     n = len(mu)
     x0 = np.repeat(1/n, n)
-    bounds = None if allow_short else [(0.0, max_weight) for _ in range(n)]
-    cons = (
+    
+    ## MODIFICADO: O limite inferior agora é customizável
+    bounds = None if allow_short else [(min_asset_weight, max_weight) for _ in range(n)]
+    
+    # Restrições base (soma dos pesos e retorno alvo)
+    cons = [
         {'type': 'eq', 'fun': lambda w: np.sum(w) - 1},
         {'type': 'eq', 'fun': lambda w: w.dot(mu) - target_return}
-    )
+    ]
+    
+    ## NOVO: Adiciona a restrição de % mínimo em ações, se ativada
+    if min_stock_pct > 0 and len(stock_syms) > 0:
+        # Cria um "vetor-máscara" (1 para ações, 0 para o resto)
+        is_stock_mask = np.array([1 if ticker in stock_syms else 0 for ticker in all_tickers])
+        stock_constraint = {
+            'type': 'ineq', # g(x) >= 0
+            'fun': lambda w: w.dot(is_stock_mask) - min_stock_pct
+        }
+        cons.append(stock_constraint)
+
+    ## NOVO: Adiciona a restrição de % mínimo em cripto, se ativada
+    if min_crypto_pct > 0 and len(crypto_syms) > 0:
+        is_crypto_mask = np.array([1 if ticker in crypto_syms else 0 for ticker in all_tickers])
+        crypto_constraint = {
+            'type': 'ineq', # g(x) >= 0
+            'fun': lambda w: w.dot(is_crypto_mask) - min_crypto_pct
+        }
+        cons.append(crypto_constraint)
+    
     def portfolio_var(w):
         return float(w.T.dot(cov).dot(w))
+        
     res = minimize(portfolio_var, x0, method='SLSQP', bounds=bounds, constraints=cons)
+    
     if not res.success:
-        raise ValueError("Optimization failed: " + res.message)
+        raise ValueError("Otimização falhou: " + res.message)
+        
     return res.x
 
-# ---------- Streamlit UI ----------
-st.title("Markowitz + Criptomoedas (integração com yfinance e cache CSV)")
+# ---------- Interface do Streamlit ----------
+st.set_page_config(layout="wide")
+st.title("Otimizador de Carteira de Markowitz (Ações e Cripto)")
 
-# 1) carregar retornos das ações
-st.markdown("**1. Carregar retornos das ações (CSV)**")
-csv_path = "data/retornos_acoes_ibovespa_2024.csv"
-st.write(f"Carregando: `{csv_path}`")
-stock_returns = pd.read_csv(csv_path, index_col=0, parse_dates=True)
-st.write("Amostra dos retornos (primeiras linhas):")
-st.dataframe(stock_returns.head())
+# --- Colunas para Inputs ---
+col1, col2 = st.columns(2)
 
-# 2) selecionar ações
-tickers = list(stock_returns.columns)
-selected_stocks = st.multiselect("Escolha ações para incluir", tickers, default=tickers[:10])
-if len(selected_stocks) == 0:
-    st.stop()
-stock_returns_sel = stock_returns[selected_stocks]
+with col1:
+    st.markdown("#### 1. Selecione os Ativos")
+    input_stocks = st.text_input("Tickers das Ações (Yahoo Finance)", value="PETR4.SA,VALE3.SA,ITUB4.SA", help="Exemplo: PETR4.SA, VALE3.SA, MGLU3.SA")
+    input_cryptos = st.text_input("Tickers das Criptomoedas (Yahoo Finance)", value="BTC-USD,ETH-USD", help="Exemplo: BTC-USD, ETH-USD, SOL-USD")
 
-# 3) adicionar criptos
-st.markdown("**2. Adicionar criptomoedas (via yfinance)**")
-st.write("Digite símbolos do Yahoo Finance (ex.: BTC-USD, ETH-USD, SOL-USD).")
-input_syms = st.text_input("Símbolos", value="BTC-USD,ETH-USD")
-crypto_syms = [s.strip().upper() for s in input_syms.split(",") if s.strip()!='']
+with col2:
+    st.markdown("#### 2. Escolha o Período e Retorno")
+    years_back = st.number_input("Anos de histórico para análise", value=3, min_value=1, max_value=20)
+    target_return_annual = st.number_input("Retorno anual alvo (%)", value=20.0, step=1.0) / 100.0
 
-# arquivo cache local
-crypto_cache_path = "data/crypto_prices.csv"
+# --- Parâmetros de Otimização ---
+st.markdown("#### 3. Parâmetros de Otimização")
+allow_short = st.checkbox("Permitir venda a descoberto (short)?", value=False)
+max_weight = st.slider("Peso máximo por ativo", min_value=0.05, max_value=1.0, value=0.35, step=0.05)
 
-# 4) buscar preços das criptos
-if st.button("Buscar dados das criptos e rodar otimização"):
-    from_dt = stock_returns.index.min()
-    to_dt = stock_returns.index.max()
-    st.write(f"Janela: {from_dt.date()} até {to_dt.date()}")
 
-    crypto_returns = {}
+## NOVO: Expander para as restrições avançadas e opcionais
+with st.expander("Restrições Avançadas (Opcional)"):
+    
+    use_min_asset_weight = st.checkbox("Definir um peso MÍNIMO por ativo?", help="Força o otimizador a alocar pelo menos essa porcentagem em cada ativo da carteira final.")
+    min_asset_weight = st.slider("Peso mínimo por ativo", min_value=0.0, max_value=0.2, value=0.01, step=0.005, disabled=not use_min_asset_weight) if use_min_asset_weight else 0.0
 
-    # Se já existe cache, usa
-    if os.path.exists(crypto_cache_path):
-        st.success(f"Lendo dados de {crypto_cache_path}")
-        prices_all = pd.read_csv(crypto_cache_path, index_col=0, parse_dates=True)
+    st.markdown("---")
+    
+    use_category_constraints = st.checkbox("Definir alocação MÍNIMA por categoria (Ações/Cripto)?")
+    if use_category_constraints:
+        min_stock_pct = st.slider("Mínimo em Ações (%)", min_value=0, max_value=100, value=50, step=5) / 100.0
+        min_crypto_pct = st.slider("Mínimo em Cripto (%)", min_value=0, max_value=100, value=10, step=5) / 100.0
     else:
-        st.warning("Baixando dados do Yahoo Finance (isso pode demorar e pode sofrer rate limit)...")
-        prices_all = pd.DataFrame()
-        for sym in crypto_syms:
-            try:
-                data = yf.download(
-                    sym,
-                    start=from_dt - timedelta(days=5),
-                    end=to_dt + timedelta(days=1),
-                    interval="1d"
-                )
-                prices_all[sym] = data['Adj Close']
-                st.write(f"{sym} baixado com {len(data)} registros.")
-                time.sleep(2)  # evitar bloqueio do Yahoo
-            except Exception as e:
-                st.error(f"Falha ao baixar {sym}: {e}")
-        # salva cache
+        min_stock_pct = 0.0
+        min_crypto_pct = 0.0
+
+
+if st.button("Executar Otimização", type="primary"):
+    
+    with st.spinner("Aguarde... Baixando dados e calculando o portfólio ótimo..."):
+        
+        # --- 1. Preparação dos Tickers e Datas ---
+        stock_syms = [s.strip().upper() for s in input_stocks.split(",") if s.strip() != '']
+        crypto_syms = [s.strip().upper() for s in input_cryptos.split(",") if s.strip() != '']
+        
+        tickers = sorted(list(set(stock_syms + crypto_syms)))
+
+        if not tickers:
+            st.warning("Por favor, insira pelo menos um ticker de ação ou criptomoeda.")
+            st.stop()
+
+        end_date = pd.Timestamp.today()
+        start_date = end_date - pd.DateOffset(years=years_back)
+        
+        # --- 2. Cache Inteligente e Download de Dados ---
         os.makedirs("data", exist_ok=True)
-        prices_all.to_csv(crypto_cache_path)
-        st.success(f"Dados salvos em cache: {crypto_cache_path}")
+        cache_filename = f"{'_'.join(tickers)}_{start_date.date()}_{end_date.date()}.csv"
+        cache_path = os.path.join("data", cache_filename)
 
-    # calcular retornos
-    for sym in crypto_syms:
-        if sym in prices_all.columns:
-            ret = prices_to_simple_returns(prices_all[sym].dropna())
-            ret.index = pd.to_datetime(ret.index.date)
-            crypto_returns[sym] = ret
+        if os.path.exists(cache_path):
+            prices_all = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        else:
+            data = yf.download(tickers, start=start_date, end=end_date, progress=False)
+            prices_all = data['Close']
+            prices_all.dropna(axis=1, how='all', inplace=True)
 
-    if len(crypto_returns) == 0:
-        st.error("Nenhuma cripto válida para incluir. Pare.")
-        st.stop()
+            if prices_all.empty:
+                st.error("Nenhum dado foi baixado. Verifique os tickers.")
+                st.stop()
+            
+            prices_all.to_csv(cache_path)
 
-    # merge returns
-    merged = align_and_merge_returns(stock_returns_sel, crypto_returns)
-    st.write("Dados combinados (últimas linhas):")
-    st.dataframe(merged.iloc[-5:])
+        # --- 3. Cálculos de Retorno e Covariância ---
+        returns = prices_all.pct_change().dropna()
+        
+        if returns.empty:
+            st.error("Não foi possível calcular os retornos.")
+            st.stop()
+        
+        # Atualiza a lista de tickers para apenas aqueles que têm dados
+        valid_tickers = returns.columns.tolist()
+        valid_stock_syms = [s for s in stock_syms if s in valid_tickers]
+        valid_crypto_syms = [c for c in crypto_syms if c in valid_tickers]
 
-    # estatísticas
-    mu_daily = merged.mean()
-    cov_daily = merged.cov()
-    mu_annual = annualize_returns(mu_daily)
-    cov_annual = annualize_cov(cov_daily)
+        mu_daily = returns.mean()
+        cov_daily = returns.cov()
+        mu_annual = annualize_returns(mu_daily)
+        cov_annual = annualize_cov(cov_daily)
 
-    st.write("Retornos anuais esperados (estimados):")
-    st.dataframe(mu_annual.sort_values(ascending=False).to_frame("Retorno anual"))
+        # --- 4. Execução da Otimização ---
+        try:
+            ## MODIFICADO: Passa todos os novos parâmetros para a função de otimização
+            weights = min_variance_weights(
+                target_return=target_return_annual, 
+                mu=mu_annual.values, 
+                cov=cov_annual.values,
+                all_tickers=valid_tickers,
+                stock_syms=valid_stock_syms,
+                crypto_syms=valid_crypto_syms,
+                allow_short=allow_short, 
+                max_weight=max_weight,
+                min_asset_weight=min_asset_weight,
+                min_stock_pct=min_stock_pct,
+                min_crypto_pct=min_crypto_pct
+            )
+            
+            w_series = pd.Series(weights, index=mu_annual.index)
 
-    # parâmetros
-    st.markdown("**Parâmetros de otimização**")
-    target_return_annual = st.number_input("Retorno alvo anual (%)", value=12.0) / 100.0
-    allow_short = st.checkbox("Permitir short?", value=False)
-    max_weight = st.number_input("Peso máximo por ativo (0-1)", value=0.3, min_value=0.0, max_value=1.0)
+            # --- 5. Exibição dos Resultados ---
+            st.success("Otimização concluída com sucesso!")
+            
+            port_ret = float(w_series.dot(mu_annual))
+            port_var = float(w_series.T.dot(cov_annual).dot(w_series))
+            port_std = np.sqrt(port_var)
 
-    # otimização
-    try:
-        weights = min_variance_weights(target_return_annual, mu_annual.values, cov_annual.values,
-                                       allow_short=allow_short, max_weight=max_weight)
-        w_series = pd.Series(weights, index=merged.columns)
-        st.write("Pesos ótimos (min variância):")
-        st.dataframe(w_series.sort_values(ascending=False).to_frame("peso"))
-        port_var = float(w_series.T.dot(cov_annual).dot(w_series))
-        port_std = np.sqrt(port_var)
-        port_ret = float(w_series.dot(mu_annual))
-        st.write(f"Retorno esperado (anual): {port_ret:.2%}, Volatilidade anual: {port_std:.2%}")
-    except Exception as e:
-        st.error("Erro na otimização: " + str(e))
+            st.markdown("### Resultados da Otimização")
+            res_col1, res_col2 = st.columns(2)
+            
+            with res_col1:
+                st.markdown("#### Alocação da Carteira")
+                st.dataframe(w_series[w_series > 0.0001].sort_values(ascending=False).to_frame("Peso (%)").applymap(lambda x: f"{x:.2%}"))
+
+            with res_col2:
+                st.markdown("#### Métricas do Portfólio")
+                st.metric(label="Retorno Anual Esperado", value=f"{port_ret:.2%}")
+                st.metric(label="Volatilidade Anual (Risco)", value=f"{port_std:.2%}")
+                st.metric(label="Índice de Sharpe (aprox.)", value=f"{port_ret / port_std:.2f}" if port_std > 0 else "N/A", help="Considerando taxa livre de risco de 0%")
+
+        except Exception as e:
+            st.error(f"Não foi possível encontrar uma carteira para as restrições definidas.")
+            st.error(f"Detalhe do erro: {e}")
+            st.warning("Tente relaxar as restrições (ex: diminuir o retorno alvo, aumentar o peso máximo, etc.).")
