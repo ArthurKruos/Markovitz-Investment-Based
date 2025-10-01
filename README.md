@@ -1,9 +1,3 @@
-Com certeza! Um bom README.md é essencial para qualquer projeto no GitHub.
-
-Preparei uma documentação completa e profissional para você. Ela está em formato Markdown, então você pode simplesmente copiar e colar o texto abaixo em um arquivo chamado README.md na pasta do seu projeto.
-
-(Copie tudo a partir daqui)
-
 Otimizador de Carteira de Markowitz com Streamlit
 Uma aplicação web interativa construída com Streamlit que implementa a Teoria Moderna de Portfólios de Harry Markowitz. A ferramenta permite aos usuários encontrar a alocação ótima de uma carteira de investimentos, composta por Ações (B3) e Criptomoedas, para minimizar o risco (volatilidade) dado um nível de retorno esperado.
 
